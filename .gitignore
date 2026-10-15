@@ -1,0 +1,12 @@
+# saved raids
+Raids/*.dat
+Raids/*.raw
+
+# raid being recorded
+current.dat
+
+# error log
+errors.dat
+
+# button position
+ui.dat
