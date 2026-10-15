@@ -54,60 +54,50 @@ end
 
 -- ---------------------------------------------------------------------------
 -- Time
--- api.Time:GetLocalTime() is unix seconds (UTC), but the game's Lua numbers are single
--- precision, so around 1.8e9 it only moves in steps of 128s: good for the date, not for
--- timing. Times within a raid are measured with the UI millisecond clock instead and saved
--- as time since the raid started ("0:12:05").
+-- api.Time:GetLocalTime() gives unix seconds (UTC) as a string, exact to the second; this is
+-- what WorldSatNav saves in its location file. The game's Lua numbers are single precision,
+-- so tonumber() on it would only move in steps of 128s. Times are kept as those strings
+-- ("1792106676") and the maths below works on them in pieces small enough to stay exact.
 -- ---------------------------------------------------------------------------
 
--- how far the UI clock may drift from the coarse wall clock before it is taken as restarted
-local CLOCK_TOLERANCE_SECONDS = 300
-
-local function currentTime()
-	return tonumber(safeCall(function() return api.Time:GetLocalTime() end))
-end
-
-local function uiMsec()
-	return tonumber(safeCall(function() return api.Time:GetUiMsec() end))
-end
-
--- Whole seconds since the raid started; never goes backwards.
-local function elapsedSeconds()
-	local now = uiMsec()
-	local base = tonumber(raid.started_msec)
-	local last = tonumber(raid.last_elapsed) or 0
-	local wall, started = currentTime(), tonumber(raid.started)
-	local byWall = (wall ~= nil and started ~= nil) and (wall - started) or nil
-	local elapsed
-	if now ~= nil and base ~= nil and now >= base
-		and (byWall == nil or math.abs((now - base) / 1000 - byWall) < CLOCK_TOLERANCE_SECONDS) then
-		elapsed = math.floor((now - base) / 1000)
-	else
-		-- the client restarted mid raid and the UI clock began again (or this raid was started
-		-- by an older version): carry on from the coarse wall clock, exact again from here on
-		elapsed = byWall and math.floor(byWall) or last
-		if now ~= nil then
-			raid.started_msec = numberToString(now - elapsed * 1000)
-		end
+-- the current unix time as a string of digits, or nil
+local function now()
+	local value = safeCall(function() return api.Time:GetLocalTime() end)
+	if type(value) == "number" then
+		value = string.format("%.0f", value)
 	end
-	elapsed = math.max(elapsed, last)
-	raid.last_elapsed = numberToString(elapsed)
-	return elapsed
+	if type(value) ~= "string" or not string.match(value, "^%d+$") then
+		return nil
+	end
+	return value
 end
 
--- "1:02:05"
-local function elapsedText(seconds)
-	return string.format("%d:%02d:%02d", math.floor(seconds / 3600), math.floor(seconds % 3600 / 60), seconds % 60)
+-- "1792106676" -> 17921, 6676 (high * 100000 + low), both exact
+local function splitTime(unix)
+	return tonumber(string.sub(unix, 1, -6)) or 0, tonumber(string.sub(unix, -5)) or 0
+end
+
+-- whole seconds from one unix time string to another
+local function secondsBetween(from, to)
+	local fromHigh, fromLow = splitTime(from)
+	local toHigh, toLow = splitTime(to)
+	return (toHigh - fromHigh) * 100000 + (toLow - fromLow)
 end
 
 local function isLeapYear(year)
 	return (year % 4 == 0 and year % 100 ~= 0) or year % 400 == 0
 end
 
--- UTC, for when TimeToDate gives nothing usable
-local function utcDate(seconds)
-	local days = math.floor(seconds / 86400)
-	local rest = seconds - days * 86400
+-- unix time string -> year, month, day, hour, minute, second (UTC)
+local function dateParts(unix)
+	-- long division by a day's seconds, one digit at a time so every step stays exact
+	local days, rest = 0, 0
+	for digit in string.gmatch(unix, "%d") do
+		rest = rest * 10 + tonumber(digit)
+		local whole = math.floor(rest / 86400)
+		days = days * 10 + whole
+		rest = rest - whole * 86400
+	end
 	local year = 1970
 	while days >= (isLeapYear(year) and 366 or 365) do
 		days = days - (isLeapYear(year) and 366 or 365)
@@ -122,28 +112,14 @@ local function utcDate(seconds)
 	return year, month, days + 1, math.floor(rest / 3600), math.floor(rest % 3600 / 60), rest % 60
 end
 
-local function dateParts(seconds)
-	local date = safeCall(function() return api.Time:TimeToDate(seconds) end)
-	if type(date) == "table" then
-		local year, month, day = tonumber(date.year), tonumber(date.month), tonumber(date.day)
-		local hour = tonumber(date.hour)
-		local minute = tonumber(date.min or date.minute)
-		local second = tonumber(date.sec or date.second)
-		if year and month and day and hour and minute and second then
-			return year, month, day, hour, minute, second
-		end
-	end
-	return utcDate(math.floor(seconds))
-end
-
 -- "2026-10-15 22:40:05"
-local function dateText(seconds)
-	return string.format("%04d-%02d-%02d %02d:%02d:%02d", dateParts(seconds))
+local function dateText(unix)
+	return string.format("%04d-%02d-%02d %02d:%02d:%02d", dateParts(unix))
 end
 
 -- "2026-10-15_22-40-05", safe as a file name
-local function fileDate(seconds)
-	return string.format("%04d-%02d-%02d_%02d-%02d-%02d", dateParts(seconds))
+local function fileDate(unix)
+	return string.format("%04d-%02d-%02d_%02d-%02d-%02d", dateParts(unix))
 end
 
 local function formatDuration(seconds)
@@ -201,9 +177,8 @@ function raidlog.LogError(message)
 	if type(list) ~= "table" then
 		list = {}
 	end
-	local seen = currentTime()
 	list[#list + 1] = {
-		time = seen and numberToString(seen) or nil,
+		time = now(),
 		message = tostring(message),
 	}
 	while #list > MAX_ERRORS do
@@ -247,7 +222,7 @@ function raidlog.ScanMembers()
 	if raid == nil then
 		return 0
 	end
-	local seen = elapsedText(elapsedSeconds())
+	local seen = now()
 	local found = 0
 	for i = 1, MAX_TEAM_MEMBERS do
 		if recordMember("team" .. i, seen) then
@@ -297,7 +272,7 @@ local function recordRaw(event, args)
 		raw[i] = plainArg(args[i])
 	end
 	raid.raw_events[#raid.raw_events + 1] = {
-		time = elapsedText(elapsedSeconds()),
+		time = now(),
 		event = event,
 		args = raw,
 	}
@@ -329,7 +304,7 @@ function raidlog.AddDrop(event, a1, a2, a3, a4, a5, a6, a7, a8)
 	end
 
 	local entry = {
-		time = elapsedText(elapsedSeconds()),
+		time = now(),
 		player = type(player) == "string" and player or "?",
 		item = itemName(itemTypeFromLink(link)) or "?",
 		count = numberToString(tonumber(amount) or 1),
@@ -366,13 +341,11 @@ function raidlog.Resume()
 end
 
 function raidlog.Start()
-	local started = currentTime() or 0
+	local started = now() or "0"
 	raid = {
 		recording = true,
-		started = numberToString(started),
-		-- the wall clock is coarse, so this can be up to a minute off
+		started = started,
 		started_text = dateText(started),
-		started_msec = numberToString(uiMsec() or 0),
 		members = {},
 		drops = {},
 	}
@@ -385,16 +358,15 @@ function raidlog.Finish()
 		return nil
 	end
 	raidlog.ScanMembers()
-	local elapsed = elapsedSeconds()
-	local ended = currentTime() or 0
-	local started = tonumber(raid.started) or ended
+	local started = raid.started
+	local ended = now() or started
 	raid.recording = nil
-	-- only needed while recording
+	-- left by older versions, which timed raids with the UI clock
 	raid.started_msec = nil
 	raid.last_elapsed = nil
-	raid.ended = numberToString(ended)
+	raid.ended = ended
 	raid.ended_text = dateText(ended)
-	raid.duration = formatDuration(elapsed)
+	raid.duration = formatDuration(secondsBetween(started, ended))
 	raid.player_count = numberToString(count(raid.members))
 	raid.drop_count = numberToString(#raid.drops)
 
@@ -419,7 +391,7 @@ function raidlog.StatusText()
 		return "Raid drops: not recording\nClick to start a new raid"
 	end
 	local text = "Raid drops: recording\nStarted " .. tostring(raid.started_text)
-		.. " (" .. formatDuration(elapsedSeconds()) .. " ago)"
+		.. " (" .. formatDuration(secondsBetween(raid.started, now() or raid.started)) .. " ago)"
 	text = text .. "\nPlayers: " .. count(raid.members) .. ", drops: " .. #raid.drops
 	local last = raid.drops[#raid.drops]
 	if last ~= nil then
