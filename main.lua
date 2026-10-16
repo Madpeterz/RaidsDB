@@ -6,7 +6,7 @@ local button = require("RaidsDB/button")
 local RaidsDB = {
 	name = "RaidsDB",
 	author = "Madpeter",
-	version = "1.0.1",
+	version = "1.1.0",
 	desc = "Logs raid drops and players"
 }
 
@@ -17,15 +17,17 @@ local DROP_EVENTS = {
 	-- your own items
 	"ADDED_ITEM",
 }
--- TEAM_MEMBERS_CHANGED fires in bursts (people joining, swapping groups), so wait and scan once
-local MEMBER_SCAN_DELAY_MS = 2000
+-- while recording, the raid members are scanned this often: joins, leaves and anyone who
+-- couldn't be read yet are all picked up by the next scan
+local MEMBER_SCAN_INTERVAL_MS = 3000
 
 local isDropEvent = {}
 for _, name in ipairs(DROP_EVENTS) do
 	isDropEvent[name] = true
 end
 
-local memberScanPending = false
+-- bumped on load and unload; a scan loop from an earlier load sees a newer id and stops
+local loadId = 0
 
 -- errors never reach chat; they are kept in RaidsDB/errors.dat
 local function runSafe(fn)
@@ -37,17 +39,15 @@ local function runSafe(fn)
 	return result
 end
 
-local function queueMemberScan()
-	if memberScanPending then
-		return
-	end
-	memberScanPending = true
-	api:DoIn(MEMBER_SCAN_DELAY_MS, function()
-		memberScanPending = false
-		if RaidsDB.eventWindow == nil then
-			return -- unloaded meanwhile
+local function scanRegularly(id)
+	api:DoIn(MEMBER_SCAN_INTERVAL_MS, function()
+		if id ~= loadId then
+			return -- unloaded or reloaded meanwhile
 		end
-		runSafe(raidlog.ScanMembers)
+		if raidlog.IsRecording() then
+			runSafe(raidlog.ScanMembers)
+		end
+		scanRegularly(id)
 	end)
 end
 
@@ -73,6 +73,7 @@ end
 
 -- Addon initialization
 local function OnLoad()
+	raidlog.SetAddonVersion(RaidsDB.version)
 	local resumed = runSafe(raidlog.Resume)
 	api.Log:Info("[" .. RaidsDB.name .. "] Starting version " .. RaidsDB.version
 		.. (resumed and ", still recording the raid from before the reload" or ""))
@@ -88,9 +89,7 @@ local function OnLoad()
 		if not raidlog.IsRecording() then
 			return
 		end
-		if event == "TEAM_MEMBERS_CHANGED" then
-			queueMemberScan()
-		elseif isDropEvent[event] then
+		if isDropEvent[event] then
 			local a1, a2, a3, a4, a5, a6, a7, a8 = ...
 			runSafe(function()
 				raidlog.AddDrop(event, a1, a2, a3, a4, a5, a6, a7, a8)
@@ -98,18 +97,17 @@ local function OnLoad()
 		end
 	end
 	RaidsDB.eventWindow:SetHandler("OnEvent", RaidsDB.EventListener)
-	RaidsDB.eventWindow:RegisterEvent("TEAM_MEMBERS_CHANGED")
 	for _, name in ipairs(DROP_EVENTS) do
 		RaidsDB.eventWindow:RegisterEvent(name)
 	end
-	-- members may have changed while unloaded
-	if raidlog.IsRecording() then
-		queueMemberScan()
-	end
+	-- members are scanned from the first tick on, also after a reload mid raid
+	loadId = loadId + 1
+	scanRegularly(loadId)
 end
 
 -- Addon cleanup; a raid still recording stays in current.dat and resumes on the next load
 local function OnUnload()
+	loadId = loadId + 1
 	-- Unregister events
 	if RaidsDB.eventWindow ~= nil then
 		RaidsDB.eventWindow:ReleaseHandler("OnEvent")

@@ -27,6 +27,8 @@ local MAX_RAW_EVENTS = 1000
 local RAW_ARG_COUNT = 8
 
 local raid = nil
+-- RaidsDB's version, saved with each raid; set from main.lua
+local addonVersion = nil
 
 local function safeCall(fn)
 	local ok, result = pcall(fn)
@@ -191,47 +193,138 @@ end
 -- Players
 -- ---------------------------------------------------------------------------
 
+-- Each member keeps a list of stays, { joined = <unix>, left = <unix> }, so leaving and
+-- rejoining later shows as two stays; the last one has no left while they are still here.
+local function openStay(member)
+	if type(member.stays) ~= "table" then
+		return nil
+	end
+	local last = member.stays[#member.stays]
+	if last ~= nil and last.left == nil then
+		return last
+	end
+	return nil
+end
+
+-- total seconds over the member's finished stays
+local function timeInRaid(member)
+	local total = 0
+	for _, stay in ipairs(member.stays or {}) do
+		if stay.joined ~= nil and stay.left ~= nil then
+			total = total + secondsBetween(stay.joined, stay.left)
+		end
+	end
+	return total
+end
+
+-- dev: what each team slot gave in the last scan, saved as raid.scan_debug
+local scanDebug = nil
+
+local function noteSlot(unit, unitId, name, byId)
+	if scanDebug == nil or (unitId == nil and name == nil and byId == nil) then
+		return
+	end
+	scanDebug[unit] = {
+		unit_id = plainArg(unitId),
+		name = plainArg(name),
+		name_by_id = plainArg(byId),
+		offline = plainArg(safeCall(function() return api.Unit:UnitIsOffline(unit) end)),
+		distance = plainArg(safeCall(function() return api.Unit:UnitDistance(unit) end)),
+	}
+end
+
+-- Returns the member's name; nil if nobody is in that slot, or nil, true if somebody is but
+-- their name can't be read yet (they only just joined or are still loading).
 local function recordMember(unit, seen)
-	local unitId = safeCall(function() return api.Unit:GetUnitId(unit) end)
-	if unitId == nil then
-		return false
-	end
+	-- the name comes first: members too far away to be loaded can have no unit id but still
+	-- have a name, like on the raid frames
 	local name = safeCall(function() return api.Unit:UnitName(unit) end)
+	local unitId = safeCall(function() return api.Unit:GetUnitId(unit) end)
+	local byId = nil
+	if (type(name) ~= "string" or name == "") and unitId ~= nil then
+		byId = safeCall(function() return api.Unit:GetUnitNameById(unitId) end)
+	end
+	noteSlot(unit, unitId, name, byId)
 	if type(name) ~= "string" or name == "" then
-		name = safeCall(function() return api.Unit:GetUnitNameById(unitId) end)
+		name = byId
 	end
 	if type(name) ~= "string" or name == "" then
-		return false
+		if unitId == nil then
+			return nil
+		end
+		return nil, true
 	end
 	local member = raid.members[name]
 	if member == nil then
 		member = { name = name, first_seen = seen }
 		raid.members[name] = member
 	end
+	if type(member.stays) ~= "table" then
+		member.stays = {}
+	end
+	if openStay(member) == nil then
+		member.stays[#member.stays + 1] = { joined = seen }
+	end
 	member.last_seen = seen
+	-- a unit id means the game had them loaded near you at least once, not only on the raid list
+	if unitId ~= nil then
+		member.seenWithRaid = true
+	elseif member.seenWithRaid == nil then
+		member.seenWithRaid = false
+	end
 	-- out of range members may not give a class yet; a later scan fills it in
 	local class = safeCall(function() return api.Ability:GetUnitClassName(unit) end)
 	if type(class) == "string" and class ~= "" then
 		member.class = class
 	end
-	return true
+	return name
 end
 
--- Adds everyone currently in the party/raid (and yourself). Returns how many were seen.
-function raidlog.ScanMembers()
-	if raid == nil then
-		return 0
-	end
-	local seen = now()
-	local found = 0
-	for i = 1, MAX_TEAM_MEMBERS do
-		if recordMember("team" .. i, seen) then
-			found = found + 1
+-- ends the stay of everyone not in present (everyone when present is nil)
+local function closeStays(present, at)
+	for name, member in pairs(raid.members) do
+		local stay = openStay(member)
+		if stay ~= nil and (present == nil or not present[name]) then
+			stay.left = at
+			member.last_seen = at
 		end
 	end
-	recordMember("player", seen)
+end
+
+-- Adds everyone currently in the party/raid (and yourself) and marks who has left.
+-- Returns how many were seen, and whether everyone could be read.
+function raidlog.ScanMembers()
+	local seen = now()
+	if raid == nil or seen == nil then
+		return 0, false
+	end
+	local present = {}
+	local found = 0
+	local unreadable = false
+	scanDebug = DEBUG and {} or nil
+	for i = 1, MAX_TEAM_MEMBERS do
+		local name, missed = recordMember("team" .. i, seen)
+		if name ~= nil then
+			present[name] = true
+			found = found + 1
+		elseif missed then
+			unreadable = true
+		end
+	end
+	local own = recordMember("player", seen)
+	if own ~= nil then
+		present[own] = true
+	end
+	-- only a full scan says who has left: an unreadable slot may be someone still here, and
+	-- not even reading yourself (loading screen etc.) is no sign that everyone left
+	local complete = own ~= nil and not unreadable
+	if complete then
+		closeStays(present, seen)
+	end
+	raid.scan_debug = scanDebug
+	scanDebug = nil
 	saveCurrent()
-	return found
+	return found, complete
 end
 
 -- ---------------------------------------------------------------------------
@@ -321,6 +414,10 @@ end
 -- Raid
 -- ---------------------------------------------------------------------------
 
+function raidlog.SetAddonVersion(version)
+	addonVersion = version
+end
+
 function raidlog.IsRecording()
 	return raid ~= nil
 end
@@ -346,6 +443,7 @@ function raidlog.Start()
 		recording = true,
 		started = started,
 		started_text = dateText(started),
+		addon_version = addonVersion,
 		members = {},
 		drops = {},
 	}
@@ -360,7 +458,12 @@ function raidlog.Finish()
 	raidlog.ScanMembers()
 	local started = raid.started
 	local ended = now() or started
+	closeStays(nil, ended)
+	for _, member in pairs(raid.members) do
+		member.time_in_raid = formatDuration(timeInRaid(member))
+	end
 	raid.recording = nil
+	raid.scan_debug = nil
 	-- left by older versions, which timed raids with the UI clock
 	raid.started_msec = nil
 	raid.last_elapsed = nil
@@ -392,7 +495,13 @@ function raidlog.StatusText()
 	end
 	local text = "Raid drops: recording\nStarted " .. tostring(raid.started_text)
 		.. " (" .. formatDuration(secondsBetween(raid.started, now() or raid.started)) .. " ago)"
-	text = text .. "\nPlayers: " .. count(raid.members) .. ", drops: " .. #raid.drops
+	local here = 0
+	for _, member in pairs(raid.members) do
+		if openStay(member) ~= nil then
+			here = here + 1
+		end
+	end
+	text = text .. "\nPlayers: " .. here .. " here, " .. count(raid.members) .. " in total, drops: " .. #raid.drops
 	local last = raid.drops[#raid.drops]
 	if last ~= nil then
 		text = text .. "\nLast: " .. last.player .. " looted " .. last.item
