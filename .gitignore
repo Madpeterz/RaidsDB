@@ -2,6 +2,9 @@
 Raids/*.dat
 Raids/*.raw
 
+# screenshot request for an outside tool
+Raids/request.sht
+
 # raid being recorded
 current.dat
 
@@ -10,3 +13,4 @@ errors.dat
 
 # button position
 ui.dat
+ignore.dat

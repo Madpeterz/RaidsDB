@@ -8,6 +8,10 @@ local raidlog = {}
 local ADDON_DIR = "RaidsDB/"
 local RAIDS_DIR = ADDON_DIR .. "Raids/"
 local CURRENT_PATH = ADDON_DIR .. "current.dat"
+-- rewritten on raid start, end and every drop so an outside tool can take a screenshot
+local SCREENSHOT_REQUEST_PATH = RAIDS_DIR .. "request.sht"
+-- optional: { items = { ["Item Name"] = true, ... } }, drops of these items ask for no screenshot
+local IGNORE_PATH = ADDON_DIR .. "ignore.dat"
 -- errors go here instead of chat; only the newest are kept
 local ERRORS_PATH = ADDON_DIR .. "errors.dat"
 local MAX_ERRORS = 20
@@ -27,6 +31,10 @@ local MAX_RAW_EVENTS = 1000
 local RAW_ARG_COUNT = 8
 
 local raid = nil
+-- screenshot requests made since load, part of each request's id
+local requestCount = 0
+-- item names from IGNORE_PATH, read when a raid starts or resumes
+local ignoredItems = {}
 -- RaidsDB's version, saved with each raid; set from main.lua
 local addonVersion = nil
 
@@ -171,6 +179,34 @@ end
 
 local function saveCurrent()
 	api.File:Write(CURRENT_PATH, raid or { recording = false })
+end
+
+-- The addon can't take a screenshot itself and can't delete files, so each request
+-- overwrites SCREENSHOT_REQUEST_PATH with a new id; the outside tool watches it for changes.
+local function requestScreenshot(request)
+	local at = now() or "0"
+	requestCount = requestCount + 1
+	request.id = at .. "-" .. numberToString(requestCount)
+	request.time = at
+	request.time_text = dateText(at)
+	api.File:Write(SCREENSHOT_REQUEST_PATH, request)
+end
+
+-- reads IGNORE_PATH; no file means nothing is ignored
+local function loadIgnoredItems()
+	ignoredItems = {}
+	local saved = safeCall(function() return api.File:Read(IGNORE_PATH) end)
+	if type(saved) ~= "table" or type(saved.items) ~= "table" then
+		return
+	end
+	for key, value in pairs(saved.items) do
+		if type(key) == "string" and value then
+			ignoredItems[key] = true
+		elseif type(value) == "string" then
+			-- also take a plain list of names
+			ignoredItems[value] = true
+		end
+	end
 end
 
 -- keeps the newest MAX_ERRORS messages in ERRORS_PATH
@@ -407,6 +443,10 @@ function raidlog.AddDrop(event, a1, a2, a3, a4, a5, a6, a7, a8)
 	end
 	raid.drops[#raid.drops + 1] = entry
 	saveCurrent()
+	if ignoredItems[entry.item] then
+		return entry
+	end
+	requestScreenshot({ reason = "drop", player = entry.player, item = entry.item, count = entry.count })
 	return entry
 end
 
@@ -434,10 +474,12 @@ function raidlog.Resume()
 	if not DEBUG then
 		raid.raw_events = nil
 	end
+	loadIgnoredItems()
 	return true
 end
 
 function raidlog.Start()
+	loadIgnoredItems()
 	local started = now() or "0"
 	raid = {
 		recording = true,
@@ -448,6 +490,7 @@ function raidlog.Start()
 		drops = {},
 	}
 	raidlog.ScanMembers()
+	requestScreenshot({ reason = "start" })
 end
 
 -- Stops recording and writes the raid to Raids/. Returns the file path and the totals.
@@ -485,6 +528,7 @@ function raidlog.Finish()
 	local totals = { players = raid.player_count, drops = raid.drop_count, duration = raid.duration }
 	raid = nil
 	saveCurrent()
+	requestScreenshot({ reason = "end", raid = path })
 	return path, totals
 end
 
