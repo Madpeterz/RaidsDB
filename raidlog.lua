@@ -183,12 +183,15 @@ end
 
 -- The addon can't take a screenshot itself and can't delete files, so each request
 -- overwrites SCREENSHOT_REQUEST_PATH with a new id; the outside tool watches it for changes.
-local function requestScreenshot(request)
+-- raidStarted is the unix start time of the raid the request belongs to.
+local function requestScreenshot(request, raidStarted)
 	local at = now() or "0"
 	requestCount = requestCount + 1
 	request.id = at .. "-" .. numberToString(requestCount)
 	request.time = at
 	request.time_text = dateText(at)
+	request.raid_started = raidStarted
+	request.raid_started_text = dateText(raidStarted)
 	api.File:Write(SCREENSHOT_REQUEST_PATH, request)
 end
 
@@ -446,7 +449,8 @@ function raidlog.AddDrop(event, a1, a2, a3, a4, a5, a6, a7, a8)
 	if ignoredItems[entry.item] then
 		return entry
 	end
-	requestScreenshot({ reason = "drop", player = entry.player, item = entry.item, count = entry.count })
+	requestScreenshot({ reason = "drop", player = entry.player, item = entry.item, count = entry.count },
+		raid.started)
 	return entry
 end
 
@@ -490,7 +494,7 @@ function raidlog.Start()
 		drops = {},
 	}
 	raidlog.ScanMembers()
-	requestScreenshot({ reason = "start" })
+	requestScreenshot({ reason = "start" }, started)
 end
 
 -- Stops recording and writes the raid to Raids/. Returns the file path and the totals.
@@ -528,7 +532,7 @@ function raidlog.Finish()
 	local totals = { players = raid.player_count, drops = raid.drop_count, duration = raid.duration }
 	raid = nil
 	saveCurrent()
-	requestScreenshot({ reason = "end", raid = path })
+	requestScreenshot({ reason = "end", raid = path }, started)
 	return path, totals
 end
 
