@@ -6,7 +6,7 @@ local button = require("RaidsDB/button")
 local RaidsDB = {
 	name = "RaidsDB",
 	author = "Madpeter",
-	version = "1.2.1",
+	version = "1.3.0",
 	desc = "Logs raid drops and players"
 }
 
