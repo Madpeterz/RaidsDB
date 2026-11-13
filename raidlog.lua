@@ -33,7 +33,7 @@ local RAW_ARG_COUNT = 8
 local raid = nil
 -- screenshot requests made since load, part of each request's id
 local requestCount = 0
--- item names from IGNORE_PATH, read when a raid starts or resumes
+-- item names from IGNORE_PATH, read when a raid starts or resumes and on every drop
 local ignoredItems = {}
 -- RaidsDB's version, saved with each raid; set from main.lua
 local addonVersion = nil
@@ -195,13 +195,14 @@ local function requestScreenshot(request, raidStarted)
 	api.File:Write(SCREENSHOT_REQUEST_PATH, request)
 end
 
--- reads IGNORE_PATH; no file means nothing is ignored
+-- reads IGNORE_PATH; no file means nothing is ignored. An unreadable file keeps the list
+-- from the last good read, so a bad edit doesn't suddenly request screenshots for everything.
 local function loadIgnoredItems()
-	ignoredItems = {}
 	local saved = safeCall(function() return api.File:Read(IGNORE_PATH) end)
 	if type(saved) ~= "table" or type(saved.items) ~= "table" then
 		return
 	end
+	ignoredItems = {}
 	for key, value in pairs(saved.items) do
 		if type(key) == "string" and value then
 			ignoredItems[key] = true
@@ -446,6 +447,8 @@ function raidlog.AddDrop(event, a1, a2, a3, a4, a5, a6, a7, a8)
 	end
 	raid.drops[#raid.drops + 1] = entry
 	saveCurrent()
+	-- read again so edits to the list apply without restarting the raid
+	loadIgnoredItems()
 	if ignoredItems[entry.item] then
 		return entry
 	end
