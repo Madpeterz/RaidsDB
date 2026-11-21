@@ -1,15 +1,15 @@
 local api = require("api")
 
--- The raid being recorded: who was in it and every item that dropped.
--- While recording, everything is kept in current.dat so a reload or crash resumes the raid;
--- Finish() moves it to Raids/<start date>.dat.
+-- Recorders for raids and instance runs: who was in it and every item that dropped.
+-- raidlog.New(options) makes one; each keeps its own run. While recording, everything is kept
+-- in options.currentPath so a reload or crash resumes the run; Finish() moves it to
+-- options.dir/<start date>.dat.
 local raidlog = {}
 
 local ADDON_DIR = "RaidsDB/"
-local RAIDS_DIR = ADDON_DIR .. "Raids/"
-local CURRENT_PATH = ADDON_DIR .. "current.dat"
 -- rewritten on raid start, end and every drop so an outside tool can take a screenshot
-local SCREENSHOT_REQUEST_PATH = RAIDS_DIR .. "request.sht"
+-- (only by recorders made with screenshots = true)
+local SCREENSHOT_REQUEST_PATH = ADDON_DIR .. "Raids/request.sht"
 -- optional: { items = { ["Item Name"] = true, ... } }, drops of these items ask for no screenshot
 local IGNORE_PATH = ADDON_DIR .. "ignore.dat"
 -- errors go here instead of chat; only the newest are kept
@@ -25,17 +25,16 @@ local ADDED_ITEM_LOOT = {
 }
 
 -- dev: keep the raw arguments of every loot event (also the ones not saved as drops) and
--- write a copy of the raid with them next to it, as Raids/<start date>.raw
+-- write a copy of the run with them next to it, as <dir>/<start date>.raw
 local DEBUG = false
 local MAX_RAW_EVENTS = 1000
 local RAW_ARG_COUNT = 8
 
-local raid = nil
 -- screenshot requests made since load, part of each request's id
 local requestCount = 0
--- item names from IGNORE_PATH, read when a raid starts or resumes and on every drop
+-- item names from IGNORE_PATH, read when a run starts or resumes and on every drop
 local ignoredItems = {}
--- RaidsDB's version, saved with each raid; set from main.lua
+-- RaidsDB's version, saved with each run; set from main.lua
 local addonVersion = nil
 
 local function safeCall(fn)
@@ -174,24 +173,20 @@ local function plainArg(value)
 end
 
 -- ---------------------------------------------------------------------------
--- Storage
+-- Shared storage
 -- ---------------------------------------------------------------------------
-
-local function saveCurrent()
-	api.File:Write(CURRENT_PATH, raid or { recording = false })
-end
 
 -- The addon can't take a screenshot itself and can't delete files, so each request
 -- overwrites SCREENSHOT_REQUEST_PATH with a new id; the outside tool watches it for changes.
--- raidStarted is the unix start time of the raid the request belongs to.
-local function requestScreenshot(request, raidStarted)
+-- runStarted is the unix start time of the raid the request belongs to.
+local function requestScreenshot(request, runStarted)
 	local at = now() or "0"
 	requestCount = requestCount + 1
 	request.id = at .. "-" .. numberToString(requestCount)
 	request.time = at
 	request.time_text = dateText(at)
-	request.raid_started = raidStarted
-	request.raid_started_text = dateText(raidStarted)
+	request.raid_started = runStarted
+	request.raid_started_text = dateText(runStarted)
 	api.File:Write(SCREENSHOT_REQUEST_PATH, request)
 end
 
@@ -229,8 +224,43 @@ function raidlog.LogError(message)
 	api.File:Write(ERRORS_PATH, list)
 end
 
+function raidlog.SetAddonVersion(version)
+	addonVersion = version
+end
+
 -- ---------------------------------------------------------------------------
--- Players
+-- Zone
+-- ---------------------------------------------------------------------------
+
+-- { group = "50", name = "Sharpwind Mines", instance = true }, or nil while the game can't
+-- say (loading screen etc.). The zone group is also the id GetZoneStateInfoByZoneId takes;
+-- the API has no other zone id.
+local function currentZone()
+	local group = safeCall(function() return api.Unit:GetCurrentZoneGroup() end)
+	if group == nil then
+		return nil
+	end
+	local info = safeCall(function() return api.Zone:GetZoneStateInfoByZoneId(group) end)
+	if type(info) ~= "table" or type(info.zoneName) ~= "string" or info.zoneName == "" then
+		return nil
+	end
+	return {
+		group = type(group) == "number" and numberToString(group) or tostring(group),
+		name = info.zoneName,
+		instance = info.isInstanceZone == true,
+	}
+end
+
+-- "Sharpwind Mines" -> "Sharpwind_Mines", safe as part of a file name
+local function fileSafe(text)
+	text = string.gsub(text, "[^%w%-]+", "_")
+	text = string.gsub(text, "^_+", "")
+	text = string.gsub(text, "_+$", "")
+	return text
+end
+
+-- ---------------------------------------------------------------------------
+-- Players (shared helpers)
 -- ---------------------------------------------------------------------------
 
 -- Each member keeps a list of stays, { joined = <unix>, left = <unix> }, so leaving and
@@ -257,134 +287,6 @@ local function timeInRaid(member)
 	return total
 end
 
--- dev: what each team slot gave in the last scan, saved as raid.scan_debug
-local scanDebug = nil
-
-local function noteSlot(unit, unitId, name, byId)
-	if scanDebug == nil or (unitId == nil and name == nil and byId == nil) then
-		return
-	end
-	scanDebug[unit] = {
-		unit_id = plainArg(unitId),
-		name = plainArg(name),
-		name_by_id = plainArg(byId),
-		offline = plainArg(safeCall(function() return api.Unit:UnitIsOffline(unit) end)),
-		distance = plainArg(safeCall(function() return api.Unit:UnitDistance(unit) end)),
-	}
-end
-
--- Returns the member's name; nil if nobody is in that slot, or nil, true if somebody is but
--- their name can't be read yet (they only just joined or are still loading).
-local function recordMember(unit, seen)
-	-- the name comes first: members too far away to be loaded can have no unit id but still
-	-- have a name, like on the raid frames
-	local name = safeCall(function() return api.Unit:UnitName(unit) end)
-	local unitId = safeCall(function() return api.Unit:GetUnitId(unit) end)
-	local byId = nil
-	if (type(name) ~= "string" or name == "") and unitId ~= nil then
-		byId = safeCall(function() return api.Unit:GetUnitNameById(unitId) end)
-	end
-	noteSlot(unit, unitId, name, byId)
-	if type(name) ~= "string" or name == "" then
-		name = byId
-	end
-	if type(name) ~= "string" or name == "" then
-		if unitId == nil then
-			return nil
-		end
-		return nil, true
-	end
-	local member = raid.members[name]
-	if member == nil then
-		member = { name = name, first_seen = seen }
-		raid.members[name] = member
-	end
-	if type(member.stays) ~= "table" then
-		member.stays = {}
-	end
-	if openStay(member) == nil then
-		member.stays[#member.stays + 1] = { joined = seen }
-	end
-	member.last_seen = seen
-	-- a unit id means the game had them loaded near you at least once, not only on the raid list
-	if unitId ~= nil then
-		member.seenWithRaid = true
-	elseif member.seenWithRaid == nil then
-		member.seenWithRaid = false
-	end
-	-- out of range members may not give a class yet; a later scan fills it in
-	local class = safeCall(function() return api.Ability:GetUnitClassName(unit) end)
-	if type(class) == "string" and class ~= "" then
-		member.class = class
-	end
-	return name
-end
-
--- ends the stay of everyone not in present (everyone when present is nil)
-local function closeStays(present, at)
-	for name, member in pairs(raid.members) do
-		local stay = openStay(member)
-		if stay ~= nil and (present == nil or not present[name]) then
-			stay.left = at
-			member.last_seen = at
-		end
-	end
-end
-
--- Adds everyone currently in the party/raid (and yourself) and marks who has left.
--- Returns how many were seen, and whether everyone could be read.
-function raidlog.ScanMembers()
-	local seen = now()
-	if raid == nil or seen == nil then
-		return 0, false
-	end
-	local present = {}
-	local found = 0
-	local unreadable = false
-	scanDebug = DEBUG and {} or nil
-	for i = 1, MAX_TEAM_MEMBERS do
-		local name, missed = recordMember("team" .. i, seen)
-		if name ~= nil then
-			present[name] = true
-			found = found + 1
-		elseif missed then
-			unreadable = true
-		end
-	end
-	local own = recordMember("player", seen)
-	if own ~= nil then
-		present[own] = true
-	end
-	-- only a full scan says who has left: an unreadable slot may be someone still here, and
-	-- not even reading yourself (loading screen etc.) is no sign that everyone left
-	local complete = own ~= nil and not unreadable
-	if complete then
-		closeStays(present, seen)
-	end
-	raid.scan_debug = scanDebug
-	scanDebug = nil
-	saveCurrent()
-	return found, complete
-end
-
--- ---------------------------------------------------------------------------
--- Drops
--- ---------------------------------------------------------------------------
-
--- the same broadcast can arrive twice; an identical drop within the same second is that repeat
-local function isDuplicate(entry)
-	for i = #raid.drops, 1, -1 do
-		local other = raid.drops[i]
-		if other.time ~= entry.time then
-			return false
-		end
-		if other.player == entry.player and other.item == entry.item and other.count == entry.count then
-			return true
-		end
-	end
-	return false
-end
-
 local function ownName()
 	local name = safeCall(function() return api.Unit:UnitName("player") end)
 	if type(name) == "string" and name ~= "" then
@@ -393,172 +295,349 @@ local function ownName()
 	return nil
 end
 
-local function recordRaw(event, args)
-	if raid.raw_events == nil then
-		raid.raw_events = {}
-	end
-	if #raid.raw_events >= MAX_RAW_EVENTS then
-		return
-	end
-	local raw = {}
-	for i = 1, RAW_ARG_COUNT do
-		raw[i] = plainArg(args[i])
-	end
-	raid.raw_events[#raid.raw_events + 1] = {
-		time = now(),
-		event = event,
-		args = raw,
-	}
-end
+-- ---------------------------------------------------------------------------
+-- Recorder
+-- ---------------------------------------------------------------------------
 
--- Records one loot event:
---   ITEM_ACQUISITION_BY_LOOT(player, link, count) everyone in the raid except you
---   ADDED_ITEM(link, count, source, "")          your own items; only kept when looted
--- Returns the saved drop, or nil (not recording, not a drop, or a repeat).
-function raidlog.AddDrop(event, a1, a2, a3, a4, a5, a6, a7, a8)
-	if raid == nil then
-		return nil
+-- options:
+--   dir          where finished runs are saved, e.g. "RaidsDB/Raids/"
+--   currentPath  the run being recorded, e.g. "RaidsDB/current.dat"
+--   title        tooltip heading, e.g. "Raid drops"
+--   noun         what a run is called in messages, e.g. "raid"
+--   screenshots  true to write screenshot requests on start, end and every drop
+--   instance     true to only start inside an instance, keep its zone_name and zone_group and
+--                name the file after it
+function raidlog.New(options)
+	local recorder = {}
+	local raid = nil
+	-- dev: what each team slot gave in the last scan, saved as raid.scan_debug
+	local scanDebug = nil
+
+	local function saveCurrent()
+		api.File:Write(options.currentPath, raid or { recording = false })
 	end
-	if DEBUG then
-		recordRaw(event, { a1, a2, a3, a4, a5, a6, a7, a8 })
-		saveCurrent()
-	end
-	local player, link, amount
-	if event == "ADDED_ITEM" then
-		if not ADDED_ITEM_LOOT[tonumber(a3)] then
-			return nil
+
+	local function screenshot(request)
+		if options.screenshots then
+			requestScreenshot(request, raid.started)
 		end
-		player, link, amount = ownName(), a1, a2
-	else
-		player, link, amount = a1, a2, a3
-	end
-	if type(link) ~= "string" then
-		return nil
 	end
 
-	local entry = {
-		time = now(),
-		player = type(player) == "string" and player or "?",
-		item = itemName(itemTypeFromLink(link)) or "?",
-		count = numberToString(tonumber(amount) or 1),
-	}
-	if isDuplicate(entry) then
-		return nil
+	local function noteSlot(unit, unitId, name, byId)
+		if scanDebug == nil or (unitId == nil and name == nil and byId == nil) then
+			return
+		end
+		scanDebug[unit] = {
+			unit_id = plainArg(unitId),
+			name = plainArg(name),
+			name_by_id = plainArg(byId),
+			offline = plainArg(safeCall(function() return api.Unit:UnitIsOffline(unit) end)),
+			distance = plainArg(safeCall(function() return api.Unit:UnitDistance(unit) end)),
+		}
 	end
-	raid.drops[#raid.drops + 1] = entry
-	saveCurrent()
-	-- read again so edits to the list apply without restarting the raid
-	loadIgnoredItems()
-	if ignoredItems[entry.item] then
-		return entry
+
+	-- Returns the member's name; nil if nobody is in that slot, or nil, true if somebody is but
+	-- their name can't be read yet (they only just joined or are still loading).
+	local function recordMember(unit, seen)
+		-- the name comes first: members too far away to be loaded can have no unit id but still
+		-- have a name, like on the raid frames
+		local name = safeCall(function() return api.Unit:UnitName(unit) end)
+		local unitId = safeCall(function() return api.Unit:GetUnitId(unit) end)
+		local byId = nil
+		if (type(name) ~= "string" or name == "") and unitId ~= nil then
+			byId = safeCall(function() return api.Unit:GetUnitNameById(unitId) end)
+		end
+		noteSlot(unit, unitId, name, byId)
+		if type(name) ~= "string" or name == "" then
+			name = byId
+		end
+		if type(name) ~= "string" or name == "" then
+			if unitId == nil then
+				return nil
+			end
+			return nil, true
+		end
+		local member = raid.members[name]
+		if member == nil then
+			member = { name = name, first_seen = seen }
+			raid.members[name] = member
+		end
+		if type(member.stays) ~= "table" then
+			member.stays = {}
+		end
+		if openStay(member) == nil then
+			member.stays[#member.stays + 1] = { joined = seen }
+		end
+		member.last_seen = seen
+		-- a unit id means the game had them loaded near you at least once, not only on the raid list
+		if unitId ~= nil then
+			member.seenWithRaid = true
+		elseif member.seenWithRaid == nil then
+			member.seenWithRaid = false
+		end
+		-- out of range members may not give a class yet; a later scan fills it in
+		local class = safeCall(function() return api.Ability:GetUnitClassName(unit) end)
+		if type(class) == "string" and class ~= "" then
+			member.class = class
+		end
+		return name
 	end
-	requestScreenshot({ reason = "drop", player = entry.player, item = entry.item, count = entry.count },
-		raid.started)
-	return entry
-end
 
--- ---------------------------------------------------------------------------
--- Raid
--- ---------------------------------------------------------------------------
+	-- ends the stay of everyone not in present (everyone when present is nil)
+	local function closeStays(present, at)
+		for name, member in pairs(raid.members) do
+			local stay = openStay(member)
+			if stay ~= nil and (present == nil or not present[name]) then
+				stay.left = at
+				member.last_seen = at
+			end
+		end
+	end
 
-function raidlog.SetAddonVersion(version)
-	addonVersion = version
-end
+	-- Adds everyone currently in the party/raid (and yourself) and marks who has left.
+	-- Returns how many were seen, and whether everyone could be read.
+	function recorder.ScanMembers()
+		local seen = now()
+		if raid == nil or seen == nil then
+			return 0, false
+		end
+		local present = {}
+		local found = 0
+		local unreadable = false
+		scanDebug = DEBUG and {} or nil
+		for i = 1, MAX_TEAM_MEMBERS do
+			local name, missed = recordMember("team" .. i, seen)
+			if name ~= nil then
+				present[name] = true
+				found = found + 1
+			elseif missed then
+				unreadable = true
+			end
+		end
+		local own = recordMember("player", seen)
+		if own ~= nil then
+			present[own] = true
+		end
+		-- only a full scan says who has left: an unreadable slot may be someone still here, and
+		-- not even reading yourself (loading screen etc.) is no sign that everyone left
+		local complete = own ~= nil and not unreadable
+		if complete then
+			closeStays(present, seen)
+		end
+		raid.scan_debug = scanDebug
+		scanDebug = nil
+		saveCurrent()
+		return found, complete
+	end
 
-function raidlog.IsRecording()
-	return raid ~= nil
-end
-
--- Picks up a raid that was still recording when the addon was unloaded. Returns true if one was.
-function raidlog.Resume()
-	local saved = api.File:Read(CURRENT_PATH)
-	if type(saved) ~= "table" or saved.recording ~= true or saved.started == nil then
+	-- the same broadcast can arrive twice; an identical drop within the same second is that repeat
+	local function isDuplicate(entry)
+		for i = #raid.drops, 1, -1 do
+			local other = raid.drops[i]
+			if other.time ~= entry.time then
+				return false
+			end
+			if other.player == entry.player and other.item == entry.item and other.count == entry.count then
+				return true
+			end
+		end
 		return false
 	end
-	raid = saved
-	raid.members = type(raid.members) == "table" and raid.members or {}
-	raid.drops = type(raid.drops) == "table" and raid.drops or {}
-	if not DEBUG then
-		raid.raw_events = nil
-	end
-	loadIgnoredItems()
-	return true
-end
 
-function raidlog.Start()
-	loadIgnoredItems()
-	local started = now() or "0"
-	raid = {
-		recording = true,
-		started = started,
-		started_text = dateText(started),
-		addon_version = addonVersion,
-		members = {},
-		drops = {},
-	}
-	raidlog.ScanMembers()
-	requestScreenshot({ reason = "start" }, started)
-end
-
--- Stops recording and writes the raid to Raids/. Returns the file path and the totals.
-function raidlog.Finish()
-	if raid == nil then
-		return nil
-	end
-	raidlog.ScanMembers()
-	local started = raid.started
-	local ended = now() or started
-	closeStays(nil, ended)
-	for _, member in pairs(raid.members) do
-		member.time_in_raid = formatDuration(timeInRaid(member))
-	end
-	raid.recording = nil
-	raid.scan_debug = nil
-	-- left by older versions, which timed raids with the UI clock
-	raid.started_msec = nil
-	raid.last_elapsed = nil
-	raid.ended = ended
-	raid.ended_text = dateText(ended)
-	raid.duration = formatDuration(secondsBetween(started, ended))
-	raid.player_count = numberToString(count(raid.members))
-	raid.drop_count = numberToString(#raid.drops)
-
-	local name = RAIDS_DIR .. fileDate(started)
-	local path = name .. ".dat"
-	local raw = raid.raw_events
-	raid.raw_events = nil
-	api.File:Write(path, raid)
-	if DEBUG then
-		raid.raw_events = raw or {}
-		api.File:Write(name .. ".raw", raid)
-	end
-	local totals = { players = raid.player_count, drops = raid.drop_count, duration = raid.duration }
-	raid = nil
-	saveCurrent()
-	requestScreenshot({ reason = "end", raid = path }, started)
-	return path, totals
-end
-
--- Text for the button's tooltip.
-function raidlog.StatusText()
-	if raid == nil then
-		return "Raid drops: not recording\nClick to start a new raid"
-	end
-	local text = "Raid drops: recording\nStarted " .. tostring(raid.started_text)
-		.. " (" .. formatDuration(secondsBetween(raid.started, now() or raid.started)) .. " ago)"
-	local here = 0
-	for _, member in pairs(raid.members) do
-		if openStay(member) ~= nil then
-			here = here + 1
+	local function recordRaw(event, args)
+		if raid.raw_events == nil then
+			raid.raw_events = {}
 		end
+		if #raid.raw_events >= MAX_RAW_EVENTS then
+			return
+		end
+		local raw = {}
+		for i = 1, RAW_ARG_COUNT do
+			raw[i] = plainArg(args[i])
+		end
+		raid.raw_events[#raid.raw_events + 1] = {
+			time = now(),
+			event = event,
+			args = raw,
+		}
 	end
-	text = text .. "\nPlayers: " .. here .. " here, " .. count(raid.members) .. " in total, drops: " .. #raid.drops
-	local last = raid.drops[#raid.drops]
-	if last ~= nil then
-		text = text .. "\nLast: " .. last.player .. " looted " .. last.item
-			.. (last.count ~= "1" and (" x" .. last.count) or "")
+
+	-- Records one loot event:
+	--   ITEM_ACQUISITION_BY_LOOT(player, link, count) everyone in the raid except you
+	--   ADDED_ITEM(link, count, source, "")          your own items; only kept when looted
+	-- Returns the saved drop, or nil (not recording, not a drop, or a repeat).
+	function recorder.AddDrop(event, a1, a2, a3, a4, a5, a6, a7, a8)
+		if raid == nil then
+			return nil
+		end
+		if DEBUG then
+			recordRaw(event, { a1, a2, a3, a4, a5, a6, a7, a8 })
+			saveCurrent()
+		end
+		local player, link, amount
+		if event == "ADDED_ITEM" then
+			if not ADDED_ITEM_LOOT[tonumber(a3)] then
+				return nil
+			end
+			player, link, amount = ownName(), a1, a2
+		else
+			player, link, amount = a1, a2, a3
+		end
+		if type(link) ~= "string" then
+			return nil
+		end
+
+		local entry = {
+			time = now(),
+			player = type(player) == "string" and player or "?",
+			item = itemName(itemTypeFromLink(link)) or "?",
+			count = numberToString(tonumber(amount) or 1),
+		}
+		if isDuplicate(entry) then
+			return nil
+		end
+		raid.drops[#raid.drops + 1] = entry
+		saveCurrent()
+		if not options.screenshots then
+			return entry
+		end
+		-- read again so edits to the list apply without restarting the raid
+		loadIgnoredItems()
+		if ignoredItems[entry.item] then
+			return entry
+		end
+		screenshot({ reason = "drop", player = entry.player, item = entry.item, count = entry.count })
+		return entry
 	end
-	return text .. "\nClick to stop and save"
+
+	function recorder.IsRecording()
+		return raid ~= nil
+	end
+
+	-- Picks up a run that was still recording when the addon was unloaded. Returns true if one was.
+	function recorder.Resume()
+		local saved = api.File:Read(options.currentPath)
+		if type(saved) ~= "table" or saved.recording ~= true or saved.started == nil then
+			return false
+		end
+		raid = saved
+		raid.members = type(raid.members) == "table" and raid.members or {}
+		raid.drops = type(raid.drops) == "table" and raid.drops or {}
+		-- left by the first 1.4.0 build, which kept a zone history
+		raid.zones = nil
+		if not DEBUG then
+			raid.raw_events = nil
+		end
+		loadIgnoredItems()
+		return true
+	end
+
+	-- Starts a new run. Returns true and a chat message, or false and the reason it didn't start.
+	function recorder.Start()
+		if raid ~= nil then
+			return false, "already recording"
+		end
+		local zone = nil
+		if options.instance then
+			zone = currentZone()
+			if zone == nil or not zone.instance then
+				return false, "you're not in an instance, zone in first and then start recording"
+			end
+		end
+		loadIgnoredItems()
+		local started = now() or "0"
+		raid = {
+			recording = true,
+			started = started,
+			started_text = dateText(started),
+			addon_version = addonVersion,
+			members = {},
+			drops = {},
+		}
+		if zone ~= nil then
+			raid.zone_name = zone.name
+			raid.zone_group = zone.group
+		end
+		recorder.ScanMembers()
+		screenshot({ reason = "start" })
+		if zone ~= nil then
+			return true, "new " .. options.noun .. " started in " .. zone.name .. ", logging drops and players"
+		end
+		return true, "new " .. options.noun .. " started, logging drops and players"
+	end
+
+	-- Stops recording and writes the run to options.dir. Returns the file path and the totals.
+	function recorder.Finish()
+		if raid == nil then
+			return nil
+		end
+		recorder.ScanMembers()
+		local started = raid.started
+		local ended = now() or started
+		closeStays(nil, ended)
+		for _, member in pairs(raid.members) do
+			member.time_in_raid = formatDuration(timeInRaid(member))
+		end
+		raid.recording = nil
+		raid.scan_debug = nil
+		-- left by older versions, which timed raids with the UI clock
+		raid.started_msec = nil
+		raid.last_elapsed = nil
+		raid.ended = ended
+		raid.ended_text = dateText(ended)
+		raid.duration = formatDuration(secondsBetween(started, ended))
+		raid.player_count = numberToString(count(raid.members))
+		raid.drop_count = numberToString(#raid.drops)
+
+		local name = options.dir .. fileDate(started)
+		if type(raid.zone_name) == "string" and fileSafe(raid.zone_name) ~= "" then
+			name = name .. "_" .. fileSafe(raid.zone_name)
+		end
+		local path = name .. ".dat"
+		local raw = raid.raw_events
+		raid.raw_events = nil
+		api.File:Write(path, raid)
+		if DEBUG then
+			raid.raw_events = raw or {}
+			api.File:Write(name .. ".raw", raid)
+		end
+		local totals = { players = raid.player_count, drops = raid.drop_count, duration = raid.duration }
+		screenshot({ reason = "end", raid = path })
+		raid = nil
+		saveCurrent()
+		return path, totals
+	end
+
+	-- Text for the button's tooltip.
+	function recorder.StatusText()
+		if raid == nil then
+			if options.instance then
+				return options.title .. ": not recording\nZone into an instance, then click to start"
+			end
+			return options.title .. ": not recording\nClick to start a new " .. options.noun
+		end
+		local text = options.title .. ": recording"
+		if raid.zone_name ~= nil then
+			text = text .. " " .. tostring(raid.zone_name)
+		end
+		text = text .. "\nStarted " .. tostring(raid.started_text)
+			.. " (" .. formatDuration(secondsBetween(raid.started, now() or raid.started)) .. " ago)"
+		local here = 0
+		for _, member in pairs(raid.members) do
+			if openStay(member) ~= nil then
+				here = here + 1
+			end
+		end
+		text = text .. "\nPlayers: " .. here .. " here, " .. count(raid.members) .. " in total, drops: " .. #raid.drops
+		local last = raid.drops[#raid.drops]
+		if last ~= nil then
+			text = text .. "\nLast: " .. last.player .. " looted " .. last.item
+				.. (last.count ~= "1" and (" x" .. last.count) or "")
+		end
+		return text .. "\nClick to stop and save"
+	end
+
+	return recorder
 end
 
 return raidlog

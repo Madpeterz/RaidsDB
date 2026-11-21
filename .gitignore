@@ -1,6 +1,8 @@
 # saved raids
 Raids/*.dat
 Raids/*.raw
+Instances/*.dat
+Instances/*.raw
 
 # screenshot request for an outside tool
 Raids/request.sht
